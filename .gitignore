@@ -1,0 +1,7 @@
+/target
+# Per-user settings written next to the exe
+SaveData/
+# Raw USB captures of my own tablet (include its serial number)
+/captures
+# IDE settings
+/.idea
