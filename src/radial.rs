@@ -88,7 +88,7 @@ pub fn fill(hovered: bool, on: bool) -> egui::Color32 {
 pub fn slice_label(map: &ButtonMap, on: bool) -> String {
     let label = action_label(&map.action);
     match map.mode {
-        Mode::Toggle => format!("{label}\n(Toggle {})", if on { "On" } else { "Off" }),
+        Mode::Toggle => format!("{label} ({})", if on { "On" } else { "Off" }),
         Mode::Hold => label,
     }
 }
