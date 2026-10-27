@@ -1,6 +1,7 @@
 # OpenPen
 
 A driver-free, Rust-based replacement for the Wacom software, mostly made for myself and for the **Wacom One (CTL-672)** tablet.
+(Untested on other Wacom tablets but if the pen has two buttons, it should probably be the same)
 
 ![OpenPen demo](docs/demo.gif)
 

@@ -8,6 +8,7 @@
 
 mod apps;
 mod config;
+mod icon;
 mod inject;
 mod radial;
 mod tablet;
@@ -549,6 +550,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("OpenPen")
+            .with_icon(Arc::new(egui::IconData { rgba: icon::rgba(64), width: 64, height: 64 }))
             .with_inner_size([720.0, 660.0])
             .with_min_inner_size([520.0, 420.0]),
         ..Default::default()
