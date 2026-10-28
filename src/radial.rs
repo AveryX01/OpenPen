@@ -18,17 +18,23 @@ use crate::inject;
 
 pub const INNER: f32 = 34.0;
 pub const OUTER: f32 = 120.0;
-/// Overlay window half-size, a little bigger than the ring.
-const HALF: f32 = OUTER + 10.0;
+/// The optional outer ring spans OUTER_IN..OUTER_MAX.
+const OUTER_IN: f32 = OUTER + 8.0;
+pub const OUTER_MAX: f32 = 195.0;
+/// Overlay window half-size, a little bigger than the outer ring.
+const HALF: f32 = OUTER_MAX + 10.0;
 
 /// What the overlay needs to draw one frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RadialView {
     /// Physical-pixel screen position of the menu center.
     pub center: (i32, i32),
+    /// Inner slices first, then the outer ring's; `inner` is where the outer ones start.
     pub labels: Vec<String>,
+    pub inner: usize,
     pub latched: Vec<bool>,
     pub hovered: Option<usize>,
+    pub color: [u8; 3],
 }
 
 /// Slice in the direction of an offset from the center. Slice 0 is at the top, going clockwise.
@@ -38,10 +44,23 @@ pub fn slice_at(dx: f32, dy: f32, count: usize) -> usize {
     (((angle + step / 2.0) / step) as usize) % count
 }
 
-/// Slice under `pos` for a ring drawn at `center` with `scale`, if inside the ring.
-pub fn slice_at_pos(center: egui::Pos2, scale: f32, pos: egui::Pos2, count: usize) -> Option<usize> {
+/// Slice under `pos` for rings drawn at `center` with `scale`, if on a ring.
+/// `inner` slices are on the inner ring, the rest of `count` on the outer.
+pub fn slice_at_pos(center: egui::Pos2, scale: f32, pos: egui::Pos2, inner: usize, count: usize) -> Option<usize> {
     let d = (pos - center) / scale;
-    (INNER..=OUTER).contains(&d.length()).then(|| slice_at(d.x, d.y, count))
+    let r = d.length();
+    if (INNER..=OUTER).contains(&r) {
+        Some(slice_at(d.x, d.y, inner))
+    } else if count > inner && (OUTER_IN..=OUTER_MAX).contains(&r) {
+        Some(inner + slice_at(d.x, d.y, count - inner))
+    } else {
+        None
+    }
+}
+
+/// Radius of the outermost ring drawn.
+pub fn extent(has_outer: bool) -> f32 {
+    if has_outer { OUTER_MAX } else { OUTER }
 }
 
 pub fn action_label(action: &Action) -> String {
@@ -51,6 +70,7 @@ pub fn action_label(action: &Action) -> String {
         Action::Mouse(MouseButton::Right) => "Right click".into(),
         Action::Mouse(MouseButton::Middle) => "Middle click".into(),
         Action::Radial(_) => "Radial".into(),
+        Action::ReleaseAll => "Reset held".into(),
         Action::Keys(k) => {
             let mut parts: Vec<String> = Vec::new();
             for (on, name) in [(k.ctrl, "Ctrl"), (k.shift, "Shift"), (k.alt, "Alt"), (k.win, "Win")] {
@@ -69,16 +89,25 @@ pub fn action_label(action: &Action) -> String {
 }
 
 pub const FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(24, 24, 29, 215);
-pub const FILL_ACTIVE: egui::Color32 = egui::Color32::from_rgba_premultiplied(39, 73, 150, 225);
-pub const FILL_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(73, 115, 202, 235);
 /// A toggle slice that is currently on.
 pub const FILL_ON: egui::Color32 = egui::Color32::from_rgba_premultiplied(105, 55, 165, 230);
 pub const FILL_ON_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(145, 90, 210, 240);
 
-pub fn fill(hovered: bool, on: bool) -> egui::Color32 {
+/// The menu's color at full strength: the hovered slice.
+fn fill_hover(color: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], 235)
+}
+
+/// A dimmer version of the menu's color, for the editor's mouse-over.
+pub fn fill_active(color: [u8; 3]) -> egui::Color32 {
+    let [r, g, b] = color.map(|c| (c as f32 * 0.6) as u8);
+    egui::Color32::from_rgba_unmultiplied(r, g, b, 225)
+}
+
+pub fn fill(hovered: bool, on: bool, color: [u8; 3]) -> egui::Color32 {
     match (hovered, on) {
         (true, true) => FILL_ON_HOVER,
-        (true, false) => FILL_HOVER,
+        (true, false) => fill_hover(color),
         (false, true) => FILL_ON,
         (false, false) => FILL,
     }
@@ -98,10 +127,30 @@ const GAP: f32 = 4.0;
 /// Width of the anti-aliasing fringe, in points.
 const FEATHER: f32 = 1.0;
 
-/// Draws the ring of slices. `fill_of(i)` picks each slice's color.
+/// Draws the inner ring of slices, plus the outer ring if `labels` has more than `inner`.
+/// `fill_of(i)` picks each slice's color.
 pub fn draw_ring(
     painter: &egui::Painter,
     center: egui::Pos2,
+    scale: f32,
+    labels: &[String],
+    inner: usize,
+    fill_of: impl Fn(usize) -> egui::Color32,
+) {
+    draw_band(painter, center, (INNER * scale, OUTER * scale), scale, &labels[..inner], &fill_of);
+    if labels.len() > inner {
+        let radii = (OUTER_IN * scale, OUTER_MAX * scale);
+        draw_band(painter, center, radii, scale, &labels[inner..], |i| fill_of(inner + i));
+    }
+    let stroke = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(90));
+    painter.circle_stroke(center, (INNER - 6.0) * scale, stroke);
+}
+
+/// One ring of slices between two radii (in screen points).
+fn draw_band(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    (r_in, r_out): (f32, f32),
     scale: f32,
     labels: &[String],
     fill_of: impl Fn(usize) -> egui::Color32,
@@ -110,7 +159,6 @@ pub fn draw_ring(
     let at = |r: f32, a: f32| center + egui::vec2(r * a.sin(), -r * a.cos());
     let n = labels.len();
     let step = TAU / n as f32;
-    let (r_in, r_out) = (INNER * scale, OUTER * scale);
     for i in 0..n {
         let mid = i as f32 * step;
         // Pull each side in by the same distance at every radius, so gaps stay parallel.
@@ -128,8 +176,6 @@ pub fn draw_ring(
             egui::Color32::WHITE,
         );
     }
-    let stroke = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(90));
-    painter.circle_stroke(center, (INNER - 6.0) * scale, stroke);
 }
 
 /// Filled annular wedge between two matching arcs, with a soft edge all around.
@@ -197,8 +243,8 @@ pub fn show_overlay(ctx: &egui::Context, view: Option<&RadialView>) -> bool {
     let shown = view.is_some();
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("openpen_radial"), builder, move |ui, _| {
         let Some(view) = &view else { return };
-        let fill_of = |i: usize| fill(view.hovered == Some(i), view.latched[i]);
-        draw_ring(ui.painter(), ui.max_rect().center(), 1.0, &view.labels, fill_of);
+        let fill_of = |i: usize| fill(view.hovered == Some(i), view.latched[i], view.color);
+        draw_ring(ui.painter(), ui.max_rect().center(), 1.0, &view.labels, view.inner, fill_of);
     });
     make_unfocusable();
     shown

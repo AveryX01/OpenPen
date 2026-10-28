@@ -15,8 +15,10 @@ The official Wacom software is unstable and missing things I wanted, mainly a ra
 - **Pressure curve:** 1–4, so full force still reaches 100% but light presses give less.
 - **Button mapping** for both pen buttons: mouse clicks, key combos (with key capture), or a radial menu. Hold or Toggle, optionally only while the tip is down.
 - **Per-app profiles:** bindings switch automatically based on the focused app (e.g. `blender.exe`), with "No profile" as the fallback.
-- **Radial menus:** separate named menus with 2–8 slices and a live clickable editor. Hold a pen button to show the ring, point, and release to pick (or tap slices with the tip). Slices are **Tap** (fires once) or **Toggle** (stays held, shown as `(On)`/`(Off)` and in purple when on).
+- **Radial menus:** separate named menus with 2–8 slices and a live clickable editor. Hold a pen button to show the ring, point, and release to pick (or tap slices with the tip). Slices are **Tap** (fires once) or **Toggle** (stays held, shown as `(On)`/`(Off)` and in purple when on). Menus can have an optional **outer ring**, picked by pointing past the inner ring. A slice can also open another radial menu as a submenu: rest on it briefly, point past its outer edge, or tap it to enter it. Each menu has its own color (random for new menus, adjustable under the preview).
+- **Reset all held:** an action for pen buttons or slices that releases every toggled key and button at once.
 - **Tray icon:** minimizing hides OpenPen to the system tray.
+- **Single instance:** launching OpenPen again just shows the running one.
 - **Self-contained:** settings live in a `SaveData` folder next to the exe.
 
 ## Download and run
@@ -74,6 +76,7 @@ Two threads share two `Arc<Mutex<_>>` values: `Config` (GUI → worker) and `Sta
 | `src/radial.rs` | Radial geometry (`slice_at`), the ring painter (`draw_ring`, shared by overlay and editor preview), labels/colors, and the overlay window. |
 | `src/apps.rs` | Focused app's exe name and the list of apps with open windows. |
 | `src/tray.rs` | System tray icon and menu. |
+| `src/single.rs` | Single-instance guard (named event; a second launch shows the first). |
 | `src/bin/*.rs` | Standalone reverse-engineering tools (not part of the app). |
 
 Non-obvious decisions worth knowing before changing things:

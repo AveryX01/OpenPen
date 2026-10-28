@@ -35,7 +35,7 @@ fn action_down(action: &Action) {
     match action {
         Action::Mouse(b) => inject::mouse_button(*b, true),
         Action::Keys(k) => inject::key_combo(k, true),
-        Action::None | Action::Radial(_) => {}
+        Action::None | Action::Radial(_) | Action::ReleaseAll => {}
     }
 }
 
@@ -43,9 +43,12 @@ fn action_up(action: &Action) {
     match action {
         Action::Mouse(b) => inject::mouse_button(*b, false),
         Action::Keys(k) => inject::key_combo(k, false),
-        Action::None | Action::Radial(_) => {}
+        Action::None | Action::Radial(_) | Action::ReleaseAll => {}
     }
 }
+
+/// How long the pen must rest on a submenu slice to enter it.
+const SUBMENU_DWELL: Duration = Duration::from_millis(300);
 
 /// One pen button's mapping state.
 #[derive(Default)]
@@ -57,14 +60,15 @@ struct ButtonState {
 }
 
 impl ButtonState {
-    /// Applies a press/release. Returns the radial menu to open, if this press opens one.
-    fn update(&mut self, pressed: bool, map: &ButtonMap) -> Option<u32> {
+    /// Applies a press/release. Returns the action for `Outputs` to run if this press is
+    /// one it handles itself (opening a radial menu, releasing everything held).
+    fn update(&mut self, pressed: bool, map: &ButtonMap) -> Option<Action> {
         let edge_down = pressed && !self.was_pressed;
         let edge_up = !pressed && self.was_pressed;
         self.was_pressed = pressed;
-        if let Action::Radial(id) = map.action {
+        if matches!(map.action, Action::Radial(_) | Action::ReleaseAll) {
             self.release();
-            return edge_down.then_some(id);
+            return edge_down.then_some(map.action);
         }
         match map.mode {
             Mode::Hold => {
@@ -119,7 +123,14 @@ struct Radial {
     /// The window that was focused when the menu opened; picked keys go to it.
     target: HWND,
     center: POINT,
+    /// Inner ring slices, then the outer ring's (from `inner` on).
     slices: Vec<ButtonMap>,
+    inner: usize,
+    /// When `hovered` last changed, for entering submenus by resting on them.
+    hovered_since: Instant,
+    /// Name of the menu each slice opens, for slices that open another radial menu.
+    submenus: Vec<Option<String>>,
+    color: [u8; 3],
     hovered: Option<usize>,
 }
 
@@ -140,6 +151,16 @@ struct Outputs {
     rel_frac: (f32, f32),
     /// Relative mode: tip acts as the left mouse button.
     left_down: bool,
+}
+
+fn submenu_names(cfg: &Config, slices: &[ButtonMap]) -> Vec<Option<String>> {
+    slices
+        .iter()
+        .map(|m| match m.action {
+            Action::Radial(id) => Some(cfg.radial(id).map_or("(missing)".into(), |r| r.name.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 fn cursor() -> POINT {
@@ -193,18 +214,20 @@ impl Outputs {
 
         let near = s.near_button && (!b.near.require_tip || s.tip);
         let far = s.far_button && (!b.far.require_tip || s.tip);
-        if let Some(id) = self.near.update(near, &b.near) {
-            self.open_radial(cfg, id, PenButton::Near, &mut s);
+        for (by, pressed) in [(PenButton::Near, near), (PenButton::Far, far)] {
+            let (state, map) = if by == PenButton::Near { (&mut self.near, &b.near) } else { (&mut self.far, &b.far) };
+            match state.update(pressed, map) {
+                Some(Action::Radial(id)) => self.open_radial(cfg, id, by, &mut s),
+                Some(Action::ReleaseAll) => self.reset_held(),
+                _ => {}
+            }
         }
-        if let Some(id) = self.far.update(far, &b.far) {
-            self.open_radial(cfg, id, PenButton::Far, &mut s);
-        }
-        self.update_radial(&mut s);
+        self.update_radial(cfg, &mut s);
         // Releasing the button picks the slice it's pointing at (center hole = cancel).
         let holding = |by| if by == PenButton::Near { near } else { far };
         if self.radial.as_ref().is_some_and(|r| !holding(r.opened_by)) {
             let menu = self.radial.take().unwrap();
-            if let Some(i) = menu.hovered {
+            if let Some(i) = menu.hovered.filter(|&i| menu.submenus[i].is_none()) {
                 self.pick_for(menu.target, menu.slices[i]);
             }
         }
@@ -224,27 +247,72 @@ impl Outputs {
             self.swallow_tip = true;
             s.tip = false;
         }
+        let slices: Vec<ButtonMap> = menu.ring().copied().collect();
         self.radial = Some(Radial {
             opened_by: by,
             target: unsafe { GetForegroundWindow() },
             center: cursor(),
-            slices: menu.slices.clone(),
+            submenus: submenu_names(cfg, &slices),
+            slices,
+            inner: menu.slices.len(),
+            hovered_since: Instant::now(),
+            color: menu.color,
             hovered: None,
         });
     }
 
+    /// Replaces the open menu with radial menu `id`, centered on the cursor. Keeps the
+    /// button and target window, so releasing still picks from the new menu.
+    fn enter_submenu(&mut self, cfg: &Config, id: u32) {
+        let (Some(menu), Some(open)) = (cfg.radial(id), &mut self.radial) else { return };
+        open.center = cursor();
+        open.slices = menu.ring().copied().collect();
+        open.inner = menu.slices.len();
+        open.submenus = submenu_names(cfg, &open.slices);
+        open.hovered_since = Instant::now();
+        open.color = menu.color;
+        open.hovered = None;
+    }
+
     /// Tracks the hovered slice; a tip press picks it and keeps the menu open (so several
     /// slices can be picked). Releasing the button picks too, see `handle`.
-    fn update_radial(&mut self, s: &mut PenSample) {
+    /// With an outer ring, pointing past the inner ring picks from the outer one. Resting
+    /// on (or tapping) a slice that opens another menu enters it.
+    fn update_radial(&mut self, cfg: &Config, s: &mut PenSample) {
         let Some(menu) = &mut self.radial else { return };
         let pos = cursor();
         let dx = (pos.x - menu.center.x) as f32 / self.dpi_scale;
         let dy = (pos.y - menu.center.y) as f32 / self.dpi_scale;
         // Picks by direction only: anywhere past the center hole counts, however far out.
         let dist = (dx * dx + dy * dy).sqrt();
-        menu.hovered = (dist >= radial::INNER).then(|| radial::slice_at(dx, dy, menu.slices.len()));
+        let (inner, total) = (menu.inner, menu.slices.len());
+        let hovered = if dist < radial::INNER {
+            None
+        } else if total > inner && dist > radial::OUTER {
+            Some(inner + radial::slice_at(dx, dy, total - inner))
+        } else {
+            Some(radial::slice_at(dx, dy, inner))
+        };
+        if hovered != menu.hovered {
+            menu.hovered = hovered;
+            menu.hovered_since = Instant::now();
+        }
+        let submenu = menu.hovered.and_then(|i| match menu.slices[i].action {
+            Action::Radial(id) => Some(id),
+            _ => None,
+        });
 
-        if s.tip {
+        if let Some(id) = submenu {
+            // Pointing past the slice's outer edge enters at once, no dwell.
+            let edge = if menu.hovered.is_some_and(|i| i >= inner) { radial::OUTER_MAX } else { radial::OUTER };
+            if s.tip || dist >= edge || menu.hovered_since.elapsed() >= SUBMENU_DWELL {
+                if s.tip {
+                    self.swallow_tip = true;
+                    s.tip = false;
+                }
+                self.enter_submenu(cfg, id);
+            }
+        } else if s.tip {
             // Every touch while open is for the menu, never the app underneath.
             let picked = menu.hovered.map(|i| menu.slices[i]);
             let target = menu.target;
@@ -268,6 +336,10 @@ impl Outputs {
 
     fn pick(&mut self, slice: ButtonMap) {
         let action = slice.action;
+        if action == Action::ReleaseAll {
+            self.reset_held();
+            return;
+        }
         match slice.mode {
             Mode::Toggle => {
                 if let Some(i) = self.latched.iter().position(|a| *a == action) {
@@ -284,6 +356,14 @@ impl Outputs {
         }
     }
 
+    /// Everything that stays held without the pen holding it: toggled slices and toggled
+    /// pen buttons.
+    fn reset_held(&mut self) {
+        self.release_latched();
+        self.near.release();
+        self.far.release();
+    }
+
     fn release_latched(&mut self) {
         for action in self.latched.drain(..) {
             action_up(&action);
@@ -294,7 +374,7 @@ impl Outputs {
     /// release them from the menu any more.
     fn prune_latched(&mut self, cfg: &Config) {
         let exists = |a: &Action| {
-            cfg.radials.iter().flat_map(|r| &r.slices).any(|s| s.mode == Mode::Toggle && s.action == *a)
+            cfg.radials.iter().flat_map(|r| r.ring()).any(|s| s.mode == Mode::Toggle && s.action == *a)
         };
         self.latched.retain(|a| {
             let keep = exists(a);
@@ -311,9 +391,20 @@ impl Outputs {
             menu.slices.iter().map(|m| m.mode == Mode::Toggle && self.latched.contains(&m.action)).collect();
         Some(RadialView {
             center: (menu.center.x, menu.center.y),
-            labels: menu.slices.iter().zip(&latched).map(|(m, &on)| radial::slice_label(m, on)).collect(),
+            inner: menu.inner,
+            labels: menu
+                .slices
+                .iter()
+                .zip(&latched)
+                .zip(&menu.submenus)
+                .map(|((m, &on), sub)| match sub {
+                    Some(name) => format!("{name} >"),
+                    None => radial::slice_label(m, on),
+                })
+                .collect(),
             latched,
             hovered: menu.hovered,
+            color: menu.color,
         })
     }
 
@@ -443,7 +534,7 @@ fn session(
 
         let mut st = status.lock().unwrap();
         if std::mem::take(&mut st.release_held) {
-            out.release_latched();
+            out.reset_held();
         }
         st.latched = out.latched.clone();
         st.active_profile = profile;

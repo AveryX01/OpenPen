@@ -11,6 +11,7 @@ mod config;
 mod icon;
 mod inject;
 mod radial;
+mod single;
 mod tablet;
 mod tray;
 mod worker;
@@ -30,7 +31,7 @@ enum Slot {
     /// A pen button in a profile (`None` = "No profile").
     Near(Option<usize>),
     Far(Option<usize>),
-    /// (radial menu index, slice index)
+    /// (radial menu index, slice index into `RadialMenu::ring`)
     Slice(usize, usize),
 }
 
@@ -44,7 +45,7 @@ fn slot_mut(cfg: &mut Config, slot: Slot) -> Option<&mut ButtonMap> {
     match slot {
         Slot::Near(p) => bindings(cfg, p).map(|b| &mut b.near),
         Slot::Far(p) => bindings(cfg, p).map(|b| &mut b.far),
-        Slot::Slice(r, i) => cfg.radials.get_mut(r)?.slices.get_mut(i),
+        Slot::Slice(r, i) => cfg.radials.get_mut(r)?.ring_mut(i),
     }
 }
 
@@ -180,6 +181,13 @@ impl eframe::App for App {
 
 impl App {
     fn main_tab(&mut self, ui: &mut egui::Ui, status: &Status) {
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
+            ui.weak(VERSION);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| self.main_settings(ui, status));
+        });
+    }
+
+    fn main_settings(&mut self, ui: &mut egui::Ui, status: &Status) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             status_section(ui, status, self.edit.bindings(status.active_profile).pressure_curve);
@@ -304,7 +312,9 @@ impl App {
             self.edit.radials.push(RadialMenu::new(self.edit.next_radial_id(), "Radial 1".into()));
         }
         self.radial_sel = self.radial_sel.min(self.edit.radials.len() - 1);
-        self.slice_sel = self.slice_sel.min(self.edit.radials[self.radial_sel].slices.len() - 1);
+        let ring_len = |app: &Self| app.edit.radials[app.radial_sel].ring().count();
+        let before = ring_len(self);
+        self.slice_sel = self.slice_sel.min(before - 1);
 
         ui.columns(2, |cols| {
             cols[0].with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -312,45 +322,82 @@ impl App {
                 ui.separator();
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     let (r, s) = (self.radial_sel, self.slice_sel);
-                    ui.heading(format!("Selected slice: {:02}", s + 1));
-                    let map = &mut self.edit.radials[r].slices[s];
-                    action_editor(ui, "Does", map, Slot::Slice(r, s), &mut self.capture, &[]);
+                    let inner = self.edit.radials[r].slices.len();
+                    ui.heading(if s < inner {
+                        format!("Selected slice: {:02}", s + 1)
+                    } else {
+                        format!("Selected outer slice: {:02}", s - inner + 1)
+                    });
+                    // The slice is borrowed mutably out of the list, so the submenu picker gets a copy.
+                    let menus = self.edit.radials.clone();
+                    if let Some(map) = self.edit.radials[r].ring_mut(s) {
+                        action_editor(ui, "Does", map, Slot::Slice(r, s), &mut self.capture, &menus);
+                    }
+                    ui.separator();
+                    self.outer_ring_controls(ui);
                 });
             });
 
             let ui = &mut cols[1];
             let menu = &self.edit.radials[self.radial_sel];
             ui.vertical_centered(|ui| ui.heading(&menu.name));
-            let size = ui.available_width().min(ui.available_height()).min(340.0);
+            let size = ui.available_width().min(ui.available_height() - 30.0).min(420.0);
             let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), size), egui::Sense::click());
             let center = rect.center();
-            let scale = size / 2.0 / (radial::OUTER + 6.0);
-            let count = menu.slices.len();
-            let hovered = response.hover_pos().and_then(|p| radial::slice_at_pos(center, scale, p, count));
+            let ring: Vec<ButtonMap> = menu.ring().copied().collect();
+            let (inner, count) = (menu.slices.len(), ring.len());
+            let scale = size / 2.0 / (radial::extent(count > inner) + 6.0);
+            let slice_at = |p| radial::slice_at_pos(center, scale, p, inner, count);
+            let hovered = response.hover_pos().and_then(slice_at);
             if response.clicked() {
-                if let Some(i) = response.interact_pointer_pos().and_then(|p| radial::slice_at_pos(center, scale, p, count)) {
+                if let Some(i) = response.interact_pointer_pos().and_then(slice_at) {
                     self.slice_sel = i;
                     self.capture = None;
                 }
             }
-            let on: Vec<bool> = menu
-                .slices
-                .iter()
-                .map(|m| m.mode == Mode::Toggle && status.latched.contains(&m.action))
-                .collect();
-            let labels: Vec<String> = menu.slices.iter().zip(&on).map(|(m, &on)| radial::slice_label(m, on)).collect();
-            let selected = self.slice_sel;
+            let on: Vec<bool> = ring.iter().map(|m| m.mode == Mode::Toggle && status.latched.contains(&m.action)).collect();
+            let labels: Vec<String> = ring.iter().zip(&on).map(|(m, &on)| radial::slice_label(m, on)).collect();
+            let (selected, color) = (self.slice_sel, menu.color);
             let fill_of = |i: usize| {
                 if i == selected {
-                    radial::fill(true, on[i])
+                    radial::fill(true, on[i], color)
                 } else if hovered == Some(i) {
-                    radial::FILL_ACTIVE
+                    radial::fill_active(color)
                 } else {
-                    radial::fill(false, on[i])
+                    radial::fill(false, on[i], color)
                 }
             };
-            radial::draw_ring(&ui.painter_at(rect), center, scale, &labels, fill_of);
+            radial::draw_ring(&ui.painter_at(rect), center, scale, &labels, inner, fill_of);
+
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut self.edit.radials[self.radial_sel].color);
+                    ui.label("Color");
+                });
+            });
         });
+
+        // Slice counts changed: indexes past the inner ring now point elsewhere.
+        let after = ring_len(self);
+        if after != before {
+            self.slice_sel = self.slice_sel.min(after - 1);
+            self.capture = None;
+        }
+    }
+
+    fn outer_ring_controls(&mut self, ui: &mut egui::Ui) {
+        let menu = &mut self.edit.radials[self.radial_sel];
+        ui.checkbox(&mut menu.outer_enabled, "Enable Outer Radial Menu");
+        if !menu.outer_enabled {
+            return;
+        }
+        if menu.outer.is_empty() {
+            menu.outer = vec![ButtonMap::new(Action::None, Mode::Hold); 8];
+        }
+        let mut count = menu.outer.len();
+        ui.add(egui::Slider::new(&mut count, config::RADIAL_MIN..=config::OUTER_RADIAL_MAX).text("Outer slices"));
+        menu.outer.resize(count, ButtonMap::new(Action::None, Mode::Hold));
+        ui.weak("Point past the inner ring to pick from the outer one.");
     }
 
     /// Which radial menu is being edited, plus its name and slice count.
@@ -370,7 +417,8 @@ impl App {
             });
             if ui.button("New").clicked() {
                 let id = self.edit.next_radial_id();
-                self.edit.radials.push(RadialMenu::new(id, format!("Radial {}", self.edit.radials.len() + 1)));
+                let name = format!("Radial {}", self.edit.radials.len() + 1);
+                self.edit.radials.push(RadialMenu::with_random_color(id, name));
                 self.radial_sel = self.edit.radials.len() - 1;
                 self.slice_sel = 0;
                 self.capture = None;
@@ -387,16 +435,15 @@ impl App {
         let mut count = menu.slices.len();
         ui.add(egui::Slider::new(&mut count, config::RADIAL_MIN..=config::RADIAL_MAX).text("Slices"));
         menu.slices.resize(count, ButtonMap::new(Action::None, Mode::Hold));
-        self.slice_sel = self.slice_sel.min(count - 1);
-        if self.capture.as_ref().is_some_and(|c| matches!(c.slot, Slot::Slice(_, i) if i >= count)) {
-            self.capture = None;
-        }
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut menu.name);
         });
     }
 }
+
+/// Shown in the Main tab; set by `version` in Cargo.toml.
+const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"));
 
 fn status_section(ui: &mut egui::Ui, status: &Status, curve: f32) {
     ui.horizontal(|ui| {
@@ -438,6 +485,7 @@ enum Kind {
     Middle,
     Keys,
     Radial,
+    ReleaseAll,
 }
 
 fn kind_of(action: &Action) -> Kind {
@@ -448,20 +496,22 @@ fn kind_of(action: &Action) -> Kind {
         Action::Mouse(MouseButton::Middle) => Kind::Middle,
         Action::Keys(_) => Kind::Keys,
         Action::Radial(_) => Kind::Radial,
+        Action::ReleaseAll => Kind::ReleaseAll,
     }
 }
 
-const KIND_LABELS: [(Kind, &str); 6] = [
+const KIND_LABELS: [(Kind, &str); 7] = [
     (Kind::None, "Nothing"),
     (Kind::Left, "Left click"),
     (Kind::Right, "Right click"),
     (Kind::Middle, "Middle click"),
     (Kind::Keys, "Keys"),
     (Kind::Radial, "Radial menu"),
+    (Kind::ReleaseAll, "Reset all held"),
 ];
 
-/// Editor for a pen button or a radial slice (slices can't open a radial menu,
-/// have "Tap" instead of "Hold", and no tip requirement).
+/// Editor for a pen button or a radial slice (slices have "Tap" instead of "Hold"
+/// and no tip requirement; a slice set to a radial menu opens it as a submenu).
 fn action_editor(
     ui: &mut egui::Ui,
     title: &str,
@@ -482,9 +532,7 @@ fn action_editor(
                 .selected_text(KIND_LABELS.iter().find(|(k, _)| *k == kind).unwrap().1)
                 .show_ui(ui, |ui| {
                     for (k, label) in KIND_LABELS {
-                        if !(is_slice && k == Kind::Radial) {
-                            ui.selectable_value(&mut kind, k, label);
-                        }
+                        ui.selectable_value(&mut kind, k, label);
                     }
                 });
             if let Action::Radial(id) = &mut map.action {
@@ -494,7 +542,7 @@ fn action_editor(
                         ui.selectable_value(id, r.id, &r.name);
                     }
                 });
-            } else {
+            } else if map.action != Action::ReleaseAll {
                 ui.radio_value(&mut map.mode, Mode::Hold, if is_slice { "Tap" } else { "Hold" });
                 ui.radio_value(&mut map.mode, Mode::Toggle, if is_slice { "Toggle (stays held)" } else { "Toggle" });
             }
@@ -507,6 +555,7 @@ fn action_editor(
                 Kind::Middle => Action::Mouse(MouseButton::Middle),
                 Kind::Keys => Action::Keys(KeyCombo::default()),
                 Kind::Radial => Action::Radial(radials.first().map_or(0, |r| r.id)),
+                Kind::ReleaseAll => Action::ReleaseAll,
             };
         }
         if !is_slice {
@@ -537,6 +586,7 @@ fn action_editor(
 }
 
 fn main() -> eframe::Result {
+    let Some(instance) = single::claim() else { return Ok(()) };
     let initial = config::load();
     let config = Arc::new(Mutex::new(initial.clone()));
     let status = Arc::new(Mutex::new(Status::default()));
@@ -560,6 +610,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let tray = tray::create(&cc.egui_ctx);
+            if let Some(tray) = &tray {
+                instance.listen(tray.flags.clone(), cc.egui_ctx.clone());
+            }
             status.lock().unwrap().gui = Some(cc.egui_ctx.clone());
             Ok(Box::new(App {
                 config,
