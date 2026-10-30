@@ -89,6 +89,8 @@ struct App {
     radial_sel: usize,
     slice_sel: usize,
     capture: Option<Capture>,
+    /// Explanation of the modifier under the mouse, shown under the radial editor.
+    hint: Option<&'static str>,
     running_apps: Vec<String>,
     apps_refreshed: Option<Instant>,
     tray: Option<tray::Tray>,
@@ -214,8 +216,8 @@ impl App {
             };
             ui.add(egui::Slider::new(&mut b.pressure_curve, 1.0..=4.0).text("Pressure curve"));
             ui.heading("Buttons");
-            action_editor(ui, "Near-tip button", &mut b.near, Slot::Near(sel), &mut self.capture, radials);
-            action_editor(ui, "Far button", &mut b.far, Slot::Far(sel), &mut self.capture, radials);
+            action_editor(ui, "Near-tip button", &mut b.near, Slot::Near(sel), &mut self.capture, &mut self.hint, radials);
+            action_editor(ui, "Far button", &mut b.far, Slot::Far(sel), &mut self.capture, &mut self.hint, radials);
         });
     }
 
@@ -316,8 +318,15 @@ impl App {
         let before = ring_len(self);
         self.slice_sel = self.slice_sel.min(before - 1);
 
+        // Set while the editor draws, so it shows from the next frame on.
+        let hint = self.hint.take();
         ui.columns(2, |cols| {
             cols[0].with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let size = egui::vec2(ui.available_width(), 36.0);
+                ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_size(size);
+                    ui.weak(hint.unwrap_or_default());
+                });
                 self.radial_menu_controls(ui);
                 ui.separator();
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -331,7 +340,7 @@ impl App {
                     // The slice is borrowed mutably out of the list, so the submenu picker gets a copy.
                     let menus = self.edit.radials.clone();
                     if let Some(map) = self.edit.radials[r].ring_mut(s) {
-                        action_editor(ui, "Does", map, Slot::Slice(r, s), &mut self.capture, &menus);
+                        action_editor(ui, "Does", map, Slot::Slice(r, s), &mut self.capture, &mut self.hint, &menus);
                     }
                     ui.separator();
                     self.outer_ring_controls(ui);
@@ -510,6 +519,18 @@ const KIND_LABELS: [(Kind, &str); 7] = [
     (Kind::ReleaseAll, "Reset all held"),
 ];
 
+const HINT_UNHOLD: &str = "\u{1F513} on the ring. Releases everything else that's held before this goes down.";
+const HINT_BURST: &str = "\u{23F3} on the ring. Stays on until this radial menu is opened again, then turns itself off.";
+
+/// Explains a modifier: under the panel for slices, as a normal tooltip on the Main tab.
+fn explain(response: egui::Response, is_slice: bool, hint: &mut Option<&'static str>, text: &'static str) {
+    if !is_slice {
+        response.on_hover_text(text);
+    } else if response.hovered() {
+        *hint = Some(text);
+    }
+}
+
 /// Editor for a pen button or a radial slice (slices have "Tap" instead of "Hold"
 /// and no tip requirement; a slice set to a radial menu opens it as a submenu).
 fn action_editor(
@@ -518,6 +539,7 @@ fn action_editor(
     map: &mut ButtonMap,
     slot: Slot,
     capture: &mut Option<Capture>,
+    hint: &mut Option<&'static str>,
     radials: &[RadialMenu],
 ) {
     let is_slice = matches!(slot, Slot::Slice(..));
@@ -563,24 +585,29 @@ fn action_editor(
         }
 
         if let Action::Keys(combo) = &mut map.action {
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut combo.ctrl, "Ctrl");
-                ui.checkbox(&mut combo.shift, "Shift");
-                ui.checkbox(&mut combo.alt, "Alt");
-                ui.checkbox(&mut combo.win, "Win");
-                let capturing = capture.as_ref().is_some_and(|c| c.slot == slot);
-                let text = if capturing {
-                    "Press a key (Esc clears)".to_string()
-                } else {
-                    combo.key.map(inject::key_name).unwrap_or_else(|| "Select Key".to_string())
-                };
-                let button = ui.selectable_label(capturing, text);
-                if button.clicked() {
-                    // Don't let Space/Enter re-trigger this button while capturing.
-                    button.surrender_focus();
-                    *capture = if capturing { None } else { Some(Capture::new(slot)) };
-                }
-            });
+            ui.checkbox(&mut combo.ctrl, "Ctrl");
+            ui.checkbox(&mut combo.shift, "Shift");
+            ui.checkbox(&mut combo.alt, "Alt");
+            ui.checkbox(&mut combo.win, "Win");
+            let unhold = ui.checkbox(&mut combo.unhold, "Unhold all");
+            explain(unhold, is_slice, hint, HINT_UNHOLD);
+            // Only toggled slices stay held, so only they have anything to release.
+            if is_slice && map.mode == Mode::Toggle {
+                let burst = ui.checkbox(&mut combo.burst, "Single Burst");
+                explain(burst, is_slice, hint, HINT_BURST);
+            }
+            let capturing = capture.as_ref().is_some_and(|c| c.slot == slot);
+            let text = if capturing {
+                "Press a key (Esc clears)".to_string()
+            } else {
+                combo.key.map(inject::key_name).unwrap_or_else(|| "Select Key".to_string())
+            };
+            let button = ui.selectable_label(capturing, text);
+            if button.clicked() {
+                // Don't let Space/Enter re-trigger this button while capturing.
+                button.surrender_focus();
+                *capture = if capturing { None } else { Some(Capture::new(slot)) };
+            }
         }
     });
 }
@@ -623,6 +650,7 @@ fn main() -> eframe::Result {
                 radial_sel: 0,
                 slice_sel: 0,
                 capture: None,
+                hint: None,
                 running_apps: Vec::new(),
                 apps_refreshed: None,
                 tray,

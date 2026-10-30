@@ -113,13 +113,32 @@ pub fn fill(hovered: bool, on: bool, color: [u8; 3]) -> egui::Color32 {
     }
 }
 
+/// Marks "Unhold all" (unlock) and "Single Burst" (hourglass). These have to be glyphs
+/// egui's bundled fonts have.
+const ICON_UNHOLD: &str = "\u{1F513}";
+const ICON_BURST: &str = "\u{23F3}";
+
 /// Slice text; toggles say whether they're on, since that's otherwise invisible.
+/// Modifier icons go on a second line, since labels can already be wide.
 pub fn slice_label(map: &ButtonMap, on: bool) -> String {
     let label = action_label(&map.action);
-    match map.mode {
+    let mut text = match map.mode {
         Mode::Toggle => format!("{label} ({})", if on { "On" } else { "Off" }),
         Mode::Hold => label,
+    };
+    if let Action::Keys(k) = map.action {
+        let burst = k.burst && map.mode == Mode::Toggle;
+        if k.unhold || burst {
+            text.push('\n');
+        }
+        if k.unhold {
+            text.push_str(ICON_UNHOLD);
+        }
+        if burst {
+            text.push_str(ICON_BURST);
+        }
     }
+    text
 }
 
 /// Gap between slices, in screen points (constant width, not a constant angle).
@@ -168,13 +187,15 @@ fn draw_band(
             (0..=SEGMENTS).map(|k| at(r, a0 + (a1 - a0) * k as f32 / SEGMENTS as f32)).collect()
         };
         painter.add(egui::Shape::mesh(wedge_mesh(&arc(r_in), &arc(r_out), fill_of(i))));
-        painter.text(
-            at((r_in + r_out) / 2.0, mid),
-            egui::Align2::CENTER_CENTER,
-            &labels[i],
-            egui::FontId::proportional(13.0 * scale.max(0.8)),
-            egui::Color32::WHITE,
-        );
+        // Line by line, since painter.text left-aligns the lines of multi-line text.
+        let font = egui::FontId::proportional(13.0 * scale.max(0.8));
+        let line_height = font.size * 1.25;
+        let lines = labels[i].lines().count();
+        for (l, line) in labels[i].lines().enumerate() {
+            let y = (l as f32 - (lines - 1) as f32 / 2.0) * line_height;
+            let pos = at((r_in + r_out) / 2.0, mid) + egui::vec2(0.0, y);
+            painter.text(pos, egui::Align2::CENTER_CENTER, line, font.clone(), egui::Color32::WHITE);
+        }
     }
 }
 

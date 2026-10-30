@@ -108,6 +108,15 @@ impl ButtonState {
     fn holds_mouse(&self) -> bool {
         matches!(self.active, Some(Action::Mouse(_)))
     }
+
+    /// Whether this press is about to activate a combo marked "Unhold all".
+    fn will_unhold(&self, pressed: bool, map: &ButtonMap) -> bool {
+        pressed && !self.was_pressed && unholds(&map.action) && (map.mode == Mode::Hold || self.active.is_none())
+    }
+}
+
+fn unholds(action: &Action) -> bool {
+    matches!(action, Action::Keys(k) if k.unhold)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -120,6 +129,8 @@ enum PenButton {
 struct Radial {
     /// The button holding it open; releasing it closes the menu.
     opened_by: PenButton,
+    /// Id of the menu the button opened, which stays the same inside submenus.
+    root: u32,
     /// The window that was focused when the menu opened; picked keys go to it.
     target: HWND,
     center: POINT,
@@ -142,6 +153,8 @@ struct Outputs {
     radial: Option<Radial>,
     /// Toggle slices picked from a radial menu, held until picked again.
     latched: Vec<Action>,
+    /// Single Burst toggles still held, with the root menu whose next opening releases them.
+    bursts: Vec<(Action, u32)>,
     /// Ignore the tip until it lifts (it was used to pick in the radial menu).
     swallow_tip: bool,
     /// Physical pixels per 96-DPI unit.
@@ -215,7 +228,15 @@ impl Outputs {
         let near = s.near_button && (!b.near.require_tip || s.tip);
         let far = s.far_button && (!b.far.require_tip || s.tip);
         for (by, pressed) in [(PenButton::Near, near), (PenButton::Far, far)] {
-            let (state, map) = if by == PenButton::Near { (&mut self.near, &b.near) } else { (&mut self.far, &b.far) };
+            let (state, other, map) = match by {
+                PenButton::Near => (&mut self.near, &mut self.far, &b.near),
+                PenButton::Far => (&mut self.far, &mut self.near, &b.far),
+            };
+            if state.will_unhold(pressed, map) {
+                other.release();
+                self.release_latched();
+            }
+            let state = if by == PenButton::Near { &mut self.near } else { &mut self.far };
             match state.update(pressed, map) {
                 Some(Action::Radial(id)) => self.open_radial(cfg, id, by, &mut s),
                 Some(Action::ReleaseAll) => self.reset_held(),
@@ -228,7 +249,7 @@ impl Outputs {
         if self.radial.as_ref().is_some_and(|r| !holding(r.opened_by)) {
             let menu = self.radial.take().unwrap();
             if let Some(i) = menu.hovered.filter(|&i| menu.submenus[i].is_none()) {
-                self.pick_for(menu.target, menu.slices[i]);
+                self.pick_for(menu.target, menu.root, menu.slices[i]);
             }
         }
 
@@ -242,6 +263,7 @@ impl Outputs {
 
     fn open_radial(&mut self, cfg: &Config, id: u32, by: PenButton, s: &mut PenSample) {
         let Some(menu) = cfg.radial(id) else { return };
+        self.release_bursts(id);
         if s.tip {
             // Opened while touching: the tip must lift before it can pick.
             self.swallow_tip = true;
@@ -250,6 +272,7 @@ impl Outputs {
         let slices: Vec<ButtonMap> = menu.ring().copied().collect();
         self.radial = Some(Radial {
             opened_by: by,
+            root: id,
             target: unsafe { GetForegroundWindow() },
             center: cursor(),
             submenus: submenu_names(cfg, &slices),
@@ -315,30 +338,34 @@ impl Outputs {
         } else if s.tip {
             // Every touch while open is for the menu, never the app underneath.
             let picked = menu.hovered.map(|i| menu.slices[i]);
-            let target = menu.target;
+            let (target, root) = (menu.target, menu.root);
             self.swallow_tip = true;
             s.tip = false;
             if let Some(slice) = picked {
-                self.pick_for(target, slice);
+                self.pick_for(target, root, slice);
             }
         }
     }
 
     /// Picks a slice, first handing focus back to `target` if anything stole it.
-    fn pick_for(&mut self, target: HWND, slice: ButtonMap) {
+    fn pick_for(&mut self, target: HWND, root: u32, slice: ButtonMap) {
         unsafe {
             if !target.is_invalid() && GetForegroundWindow() != target {
                 let _ = SetForegroundWindow(target);
             }
         }
-        self.pick(slice);
+        self.pick(root, slice);
     }
 
-    fn pick(&mut self, slice: ButtonMap) {
+    fn pick(&mut self, root: u32, slice: ButtonMap) {
         let action = slice.action;
         if action == Action::ReleaseAll {
             self.reset_held();
             return;
+        }
+        // Turning a toggle back off leaves everything else alone.
+        if unholds(&action) && !self.latched.contains(&action) {
+            self.reset_held();
         }
         match slice.mode {
             Mode::Toggle => {
@@ -347,6 +374,10 @@ impl Outputs {
                 } else if !matches!(action, Action::None | Action::Radial(_)) {
                     action_down(&action);
                     self.latched.push(action);
+                    self.bursts.retain(|(a, _)| *a != action);
+                    if matches!(action, Action::Keys(k) if k.burst) {
+                        self.bursts.push((action, root));
+                    }
                 }
             }
             Mode::Hold => {
@@ -364,7 +395,19 @@ impl Outputs {
         self.far.release();
     }
 
+    /// Releases the Single Burst toggles that were picked under root menu `root`.
+    fn release_bursts(&mut self, root: u32) {
+        let (due, rest): (Vec<_>, Vec<_>) = self.bursts.drain(..).partition(|(_, r)| *r == root);
+        self.bursts = rest;
+        for (action, _) in due {
+            if let Some(i) = self.latched.iter().position(|a| *a == action) {
+                action_up(&self.latched.remove(i));
+            }
+        }
+    }
+
     fn release_latched(&mut self) {
+        self.bursts.clear();
         for action in self.latched.drain(..) {
             action_up(&action);
         }

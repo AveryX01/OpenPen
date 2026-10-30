@@ -20,6 +20,12 @@ pub struct KeyCombo {
     pub win: bool,
     /// Windows virtual-key code of the main key, if any (modifiers alone are fine).
     pub key: Option<u16>,
+    /// Release everything else that's held before this combo goes down.
+    #[serde(default)]
+    pub unhold: bool,
+    /// Toggle slices: released the next time the same radial menu is opened.
+    #[serde(default)]
+    pub burst: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -163,7 +169,7 @@ fn default_radials() -> Vec<RadialMenu> {
 }
 
 fn default_slices() -> Vec<ButtonMap> {
-    let keys = |ctrl, shift, alt, key| Action::Keys(KeyCombo { ctrl, shift, alt, win: false, key });
+    let keys = |ctrl, shift, alt, key| Action::Keys(KeyCombo { ctrl, shift, alt, win: false, key, unhold: false, burst: false });
     vec![
         ButtonMap::new(keys(true, false, false, None), Mode::Toggle),
         ButtonMap::new(keys(false, true, false, None), Mode::Toggle),

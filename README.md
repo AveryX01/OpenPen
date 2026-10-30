@@ -16,7 +16,7 @@ The official Wacom software is unstable and missing things I wanted, mainly a ra
 - **Button mapping** for both pen buttons: mouse clicks, key combos (with key capture), or a radial menu. Hold or Toggle, optionally only while the tip is down.
 - **Per-app profiles:** bindings switch automatically based on the focused app (e.g. `blender.exe`), with "No profile" as the fallback.
 - **Radial menus:** separate named menus with 2–8 slices and a live clickable editor. Hold a pen button to show the ring, point, and release to pick (or tap slices with the tip). Slices are **Tap** (fires once) or **Toggle** (stays held, shown as `(On)`/`(Off)` and in purple when on). Menus can have an optional **outer ring**, picked by pointing past the inner ring. A slice can also open another radial menu as a submenu: rest on it briefly, point past its outer edge, or tap it to enter it. Each menu has its own color (random for new menus, adjustable under the preview).
-- **Reset all held:** an action for pen buttons or slices that releases every toggled key and button at once.
+- **Reset all held:** an action for pen buttons or slices that releases every toggled key and button at once. Key combos can also be marked **Unhold all** to do this first, so switching from Ctrl to Shift is one pick. Toggle slices marked **Single Burst** turn themselves off the next time that radial menu is opened. Slices show them as 🔓 and ⏳ under their label.
 - **Tray icon:** minimizing hides OpenPen to the system tray.
 - **Single instance:** launching OpenPen again just shows the running one.
 - **Self-contained:** settings live in a `SaveData` folder next to the exe.
